@@ -1,11 +1,11 @@
 import requests
 import json
+import os
 
 # Replace with your own Discord webhook URL
-YOUR_DISCORD_WEBHOOK_URL = 'https://discord.com/api/webhooks/1234567890/ABCDEFGHIJKLMN0123456789'
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
-
-def send_webhook_message(message, webhook_url=YOUR_DISCORD_WEBHOOK_URL):
+def send_webhook_message(message, webhook_url=DISCORD_WEBHOOK_URL):
     """Send a message to a Discord channel via webhook."""
     data = {
         'content': message,  # The message content

@@ -151,3 +151,4 @@ cython_debug/
 #.idea/
 /strategy_position.json
 /.idea
+order_history.json
