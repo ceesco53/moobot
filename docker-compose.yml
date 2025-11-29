@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   postgres:
     image: postgres:18
@@ -15,7 +13,7 @@ services:
     volumes:
       # Postgres 18 expects a single mount at /var/lib/postgresql with
       # versioned subdirectories inside (see upstream image docs).
-      - db_data:/var/lib/postgresql
+      - ${POSTGRES_DATA_FOLDER:-db_data}:/var/lib/postgresql
       - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
       # Mount host CSV directory into container (read-only). Adjust host path as needed.
       - /Users/johnnelson/code/ohcv/trades:/data:ro
