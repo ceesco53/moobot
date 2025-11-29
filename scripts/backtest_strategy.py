@@ -266,9 +266,12 @@ def maybe_plot_debug(
     equity_ts, equity_vals = compute_equity_curve(df_plot["ts"], df_plot["close"], trades_df, ticker, STARTING_CASH)
     fig.add_trace(go.Scatter(x=equity_ts, y=equity_vals, name="equity", line=dict(color="teal")), row=3, col=1)
 
-    total_trades = len(trades_df) if trades_df is not None else 0
-    buy_count = len(trades_df[trades_df["side"] == "BUY"]) if trades_df is not None else 0
-    sell_count = len(trades_df[trades_df["side"] == "SELL"]) if trades_df is not None else 0
+    if trades_df is not None and not trades_df.empty and "side" in trades_df.columns:
+        total_trades = len(trades_df)
+        buy_count = len(trades_df[trades_df["side"] == "BUY"])
+        sell_count = len(trades_df[trades_df["side"] == "SELL"])
+    else:
+        total_trades = buy_count = sell_count = 0
     fig.add_annotation(
         xref="paper",
         yref="paper",
@@ -369,12 +372,16 @@ def compute_equity_curve(ts_series, close_series, trades_df, ticker: str, starti
     closes = list(close_series)
     if not ts_list:
         return [], []
+    if trades_df is None or trades_df.empty or "ticker" not in trades_df.columns:
+        return ts_list, [float(starting_cash)] * len(ts_list)
     cash = float(starting_cash)
     pos = 0
-    trades = trades_df[trades_df["ticker"] == ticker].copy() if trades_df is not None else pd.DataFrame()
-    if not trades.empty and pd.api.types.is_datetime64_any_dtype(trades["timestamp"]) and trades["timestamp"].dt.tz is not None:
+    trades = trades_df[trades_df["ticker"] == ticker].copy()
+    if trades.empty:
+        return ts_list, [float(starting_cash)] * len(ts_list)
+    if pd.api.types.is_datetime64_any_dtype(trades["timestamp"]) and trades["timestamp"].dt.tz is not None:
         trades["timestamp"] = trades["timestamp"].dt.tz_convert(None)
-    trades = trades.sort_values("timestamp") if not trades.empty else trades
+    trades = trades.sort_values("timestamp")
     equity = []
     ti = 0
     for ts, close in zip(ts_list, closes):
@@ -451,12 +458,12 @@ def backtest(
         scaled_qty = max(1, int(round(qty * (risk_scale / 3.0)))) if qty > 0 else 0
 
         one_min = one_min_map[ticker]
-        trades_out, pos, cash_delta = strategy.generate_trades(
-            ticker=ticker, g_drive=g_drive, one_min=one_min, info=info, qty=scaled_qty, stats=stats
+        trades_out, pos, end_cash = strategy.generate_trades(
+            ticker=ticker, g_drive=g_drive, one_min=one_min, info=info, qty=scaled_qty, stats=stats, starting_cash=cash
         )
         trades.extend(trades_out)
         positions[ticker] = pos
-        cash += cash_delta
+        cash = end_cash
 
     # Mark-to-market any residual positions at last price
     for ticker, pos in positions.items():
@@ -538,6 +545,20 @@ def main():
     parser.add_argument("--rules-json", help="Path to LLM-generated rules JSON.")
     parser.add_argument("--cost-per-share", type=float, default=0.0, help="Per-share commission/fee for backtests.")
     parser.add_argument("--slippage-bps", type=float, default=0.0, help="Slippage cost in basis points of notional.")
+    parser.add_argument("--min-qty", type=int, default=1, help="Minimum tradable size after downsizing.")
+    parser.add_argument(
+        "--cooldown-minutes", type=int, default=0, help="Minimum minutes between successful entries per ticker."
+    )
+    parser.add_argument("--take-profit-pct", type=float, default=0.0, help="Take profit barrier as fraction (e.g., 0.01).")
+    parser.add_argument("--stop-loss-pct", type=float, default=0.0, help="Stop loss barrier as fraction (e.g., 0.005).")
+    parser.add_argument(
+        "--max-holding-minutes", type=int, default=0, help="Time barrier in minutes (0 means no time barrier)."
+    )
+    parser.add_argument("--threads", type=int, default=1, help="Number of threads for per-ticker backtest work.")
+    parser.add_argument("--wf-test-days", type=int, default=0, help="Walk-forward test window size in days (0 to disable).")
+    parser.add_argument(
+        "--wf-embargo-days", type=int, default=0, help="Days to skip between walk-forward folds to avoid leakage."
+    )
     args = parser.parse_args()
 
     qty_override = {}
@@ -584,6 +605,22 @@ def main():
         f"{day_counts.head(10).to_dict(orient='records')} ... total days={len(day_counts)}, "
         f"min/max rows={day_counts['rows'].min()}/{day_counts['rows'].max()}"
     )
+    # Identify missing date gaps per ticker within the requested range
+    start_date = pd.to_datetime(args.start).date()
+    end_date = pd.to_datetime(args.end).date()
+    for ticker, g in day_counts.groupby("ticker"):
+        dates = sorted(g["ts"].tolist())
+        gaps = []
+        prev = start_date
+        for d in dates:
+            if (d - prev).days > 1:
+                gaps.append((prev + pd.Timedelta(days=1), d - pd.Timedelta(days=1)))
+            prev = d
+        if (end_date - prev).days > 1:
+            gaps.append((prev + pd.Timedelta(days=1), end_date - pd.Timedelta(days=1)))
+        if gaps:
+            gap_str = "; ".join([f"{g[0]}->{g[1]}" for g in gaps])
+            print(f"Missing date ranges for {ticker}: {gap_str}")
 
     rule_fns = None
     if args.rules_json:
@@ -608,13 +645,6 @@ def main():
         except Exception as exc:
             print(f"Failed to load rules from {args.rules_json}: {exc}")
 
-    if args.one_min:
-        df_1m = compute_indicators_1m_only(df_1m, args.macd_fast, args.macd_slow, args.macd_signal)
-        df_5m = pd.DataFrame()
-    else:
-        df_5m = resample_5m(df_1m)
-        df_1m, df_5m = compute_indicators(df_1m, df_5m, args.macd_fast, args.macd_slow, args.macd_signal)
-
     strat = Strategy(
         StrategyConfig(
             macd_diff_pct=args.macd_diff_pct,
@@ -623,26 +653,42 @@ def main():
             rule_fns=rule_fns,
             cost_per_share=args.cost_per_share,
             slippage_bps=args.slippage_bps,
+            min_qty=args.min_qty,
+            cooldown_minutes=args.cooldown_minutes,
+            take_profit_pct=args.take_profit_pct,
+            stop_loss_pct=args.stop_loss_pct,
+            max_holding_minutes=args.max_holding_minutes,
         )
     )
 
-    results = backtest(
-        strat,
-        df_1m,
-        df_5m,
-        qty_override,
-        llm_config=llm_config,
-        one_min_mode=args.one_min,
-        default_qty=args.default_qty,
-    )
-    trades_df = results["trades"]
-    print(f"Cash PnL (no costs): {results['cash_pnl']:.2f}")
-    if trades_df.empty:
-        print("No trades generated.")
-    else:
-        print(trades_df.to_string(index=False))
+    def run_backtest_on_df(df_input: pd.DataFrame, tag: str = "full"):
+        if df_input.empty:
+            print(f"[{tag}] No data.")
+            return None
+        if args.one_min:
+            df1 = compute_indicators_1m_only(df_input, args.macd_fast, args.macd_slow, args.macd_signal)
+            df5 = pd.DataFrame()
+        else:
+            df5 = resample_5m(df_input)
+            df1, df5 = compute_indicators(df_input, df5, args.macd_fast, args.macd_slow, args.macd_signal)
+        res = backtest(
+            strat,
+            df1,
+            df5,
+            qty_override,
+            llm_config=llm_config,
+            one_min_mode=args.one_min,
+            default_qty=args.default_qty,
+        )
+        trades = res["trades"]
+        pnl = res["cash_pnl"]
+        print(f"[{tag}] Cash PnL (no costs): {pnl:.2f} | trades: {len(trades)}")
+        return res, df1, df5
 
-    if llm_config and results.get("llm_annotations"):
+    results, df_1m_ind, df_5m_ind = run_backtest_on_df(df_1m, tag="full")
+    trades_df = results["trades"] if results else pd.DataFrame()
+
+    if llm_config and results and results.get("llm_annotations"):
         print("\nLLM annotations:")
         for ticker, ann in results["llm_annotations"].items():
             src = results["llm_sources"].get(ticker, "?")
@@ -651,7 +697,7 @@ def main():
                 f"do_not_trade={ann.get('do_not_trade')} note={ann.get('note')} ({src})"
             )
 
-    if results.get("stats"):
+    if results and results.get("stats"):
         print("\nDebug stats (per ticker):")
         for ticker, st in results["stats"].items():
             print(
@@ -659,11 +705,25 @@ def main():
                 f"filter_pass={st.get('filter_pass')} llm_skips={st.get('llm_skip')} qty_skips={st.get('qty_skip')}"
             )
 
-    if args.debug_plot_ticker:
-        driving = df_1m if args.one_min else df_5m
+    if args.wf_test_days > 0:
+        print("\nWalk-forward evaluation:")
+        dates = sorted(df_1m["ts"].dt.date.unique())
+        start_idx = 0
+        fold = 1
+        while start_idx < len(dates):
+            test_dates = dates[start_idx : start_idx + args.wf_test_days]
+            if not test_dates:
+                break
+            df_fold = df_1m[df_1m["ts"].dt.date.isin(test_dates)]
+            res_fold, _, _ = run_backtest_on_df(df_fold, tag=f"fold{fold} {test_dates[0]}->{test_dates[-1]}")
+            start_idx += args.wf_test_days + args.wf_embargo_days
+            fold += 1
+
+    if args.debug_plot_ticker and results:
+        driving = df_1m_ind if args.one_min else df_5m_ind
         maybe_plot_debug(
             ticker=args.debug_plot_ticker.upper(),
-            df_1m=df_1m,
+            df_1m=df_1m_ind,
             df_drive=driving,
             trades_df=trades_df,
             out_path=args.debug_plot_path,

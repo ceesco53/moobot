@@ -28,11 +28,41 @@ class StrategyConfig:
     rule_fns: Optional[List] = None
     cost_per_share: float = 0.0  # fixed fee per share
     slippage_bps: float = 0.0    # bps cost on notional
+    min_qty: int = 1             # minimum tradable size after downsizing
+    cooldown_minutes: int = 0    # minimum minutes between successful entries
+    take_profit_pct: float = 0.0  # e.g., 0.01 for +1%
+    stop_loss_pct: float = 0.0    # e.g., 0.005 for -0.5%
+    max_holding_minutes: int = 0  # time barrier; 0 = no limit
 
 
 class Strategy:
     def __init__(self, config: StrategyConfig):
         self.config = config
+
+    def _evaluate_barrier(
+        self, entry_ts: pd.Timestamp, entry_price: float, one_min: pd.DataFrame
+    ) -> Optional[Tuple[pd.Timestamp, float, str]]:
+        """Return first barrier hit (tp/sl/time) using 1m closes; None if insufficient data."""
+        horizon_ts = None
+        if self.config.max_holding_minutes > 0:
+            horizon_ts = entry_ts + pd.Timedelta(minutes=self.config.max_holding_minutes)
+        future = one_min[one_min.index > entry_ts]
+        if horizon_ts is not None:
+            future = future[future.index <= horizon_ts]
+        if future.empty:
+            return None
+        tp = entry_price * (1 + self.config.take_profit_pct) if self.config.take_profit_pct > 0 else None
+        sl = entry_price * (1 - self.config.stop_loss_pct) if self.config.stop_loss_pct > 0 else None
+        for ts, row in future.iterrows():
+            px = float(row["close"])
+            if tp is not None and px >= tp:
+                return ts, px, "TP"
+            if sl is not None and px <= sl:
+                return ts, px, "SL"
+        # If horizon set, exit at last bar in horizon; else at last future bar
+        last_ts = future.index[-1]
+        last_px = float(future.iloc[-1]["close"])
+        return last_ts, last_px, "TIME"
 
     def generate_trades(
         self,
@@ -42,14 +72,16 @@ class Strategy:
         info: Optional[Dict[str, Any]],
         qty: int,
         stats: Dict[str, Dict[str, int]],
+        starting_cash: float,
     ) -> Tuple[List[Trade], int, float]:
         """
         Core MACD-driven trade generation.
-        Returns (trades, ending_position, cash_delta).
+        Returns (trades, ending_position, ending_cash).
         """
         trades: List[Trade] = []
-        cash = 0.0
+        cash = float(starting_cash)
         pos = 0
+        last_entry_ts: Optional[pd.Timestamp] = None
 
         g_drive = g_drive.sort_values("ts").reset_index(drop=True)
         macd_col = "macd"
@@ -108,23 +140,59 @@ class Strategy:
                     stats[ticker]["llm_skip"] += 1
                     continue
                 stats[ticker]["filter_pass"] += 1
+                if self.config.cooldown_minutes > 0 and last_entry_ts is not None:
+                    delta_minutes = (ts - last_entry_ts).total_seconds() / 60.0
+                    if delta_minutes < self.config.cooldown_minutes:
+                        continue
                 trade_qty = qty
+                if trade_qty < self.config.min_qty:
+                    stats[ticker]["qty_skip"] += 1
+                    continue
                 exec_price = float(price)
                 fee = trade_qty * self.config.cost_per_share + trade_qty * exec_price * (self.config.slippage_bps / 10000.0)
+                total_cost = trade_qty * exec_price + fee
+                while total_cost > cash and trade_qty > self.config.min_qty:
+                    trade_qty -= 1
+                    fee = trade_qty * self.config.cost_per_share + trade_qty * exec_price * (self.config.slippage_bps / 10000.0)
+                    total_cost = trade_qty * exec_price + fee
+                if total_cost > cash or trade_qty < self.config.min_qty:
+                    stats[ticker]["qty_skip"] += 1
+                    continue
                 trades.append(Trade(ts, ticker, "BUY", exec_price, trade_qty))
                 pos += trade_qty
-                cash -= trade_qty * exec_price
-                cash -= fee
+                cash -= total_cost
+                last_entry_ts = ts
+                # Triple-barrier exit if configured
+                if (
+                    self.config.take_profit_pct > 0
+                    or self.config.stop_loss_pct > 0
+                    or self.config.max_holding_minutes > 0
+                ):
+                    barrier = self._evaluate_barrier(ts, exec_price, one_min)
+                    if barrier is None:
+                        continue
+                    exit_ts, exit_px, _ = barrier
+                    fee_sell = trade_qty * self.config.cost_per_share + trade_qty * exit_px * (self.config.slippage_bps / 10000.0)
+                    trades.append(Trade(exit_ts, ticker, "SELL", float(exit_px), trade_qty))
+                    pos -= trade_qty
+                    cash += trade_qty * float(exit_px)
+                    cash -= fee_sell
 
-            if macd_bear:
-                if pos <= 0:
-                    continue
-                sell_qty = pos
-                exec_price = float(price)
-                fee = sell_qty * self.config.cost_per_share + sell_qty * exec_price * (self.config.slippage_bps / 10000.0)
-                trades.append(Trade(ts, ticker, "SELL", exec_price, sell_qty))
-                pos -= sell_qty
-                cash += sell_qty * exec_price
-                cash -= fee
+            # If no barrier configured, use MACD bear to exit
+            if (
+                self.config.take_profit_pct == 0
+                and self.config.stop_loss_pct == 0
+                and self.config.max_holding_minutes == 0
+            ):
+                if macd_bear:
+                    if pos <= 0:
+                        continue
+                    sell_qty = pos
+                    exec_price = float(price)
+                    fee = sell_qty * self.config.cost_per_share + sell_qty * exec_price * (self.config.slippage_bps / 10000.0)
+                    trades.append(Trade(ts, ticker, "SELL", exec_price, sell_qty))
+                    pos -= sell_qty
+                    cash += sell_qty * exec_price
+                    cash -= fee
 
         return trades, pos, cash
