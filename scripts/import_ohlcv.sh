@@ -19,6 +19,7 @@ PARALLEL="${PARALLEL:-4}"
 PAVE="${PAVE:-0}"
 MINIO_ALIAS="${MINIO_ALIAS:-realmclick}"
 MINIO_PREFIX="${MINIO_PREFIX:-flatfiles/us_stocks_sip/minute_aggs_v1/2025}"
+MONTHS="${MONTHS:-0}" # 0 means no limit; otherwise limit to this many months back based on object path dates
 
 if ! command -v psql >/dev/null 2>&1; then
   echo "psql is required on the host to run this script." >&2
@@ -102,8 +103,34 @@ export -f import_file
 export DB_URL
 export MINIO_ALIAS MINIO_PREFIX
 
-# Find objects in MinIO prefix and import
-mc find "${MINIO_ALIAS}/${MINIO_PREFIX}" --name "*.csv" --name "*.csv.gz" --exec 'echo {}' | \
-  xargs -I{} -n1 -P "$PARALLEL" bash -c 'import_file "$@"' _ {}
+# Find objects in MinIO prefix (optionally limit by months)
+find_cmd=(mc find "${MINIO_ALIAS}/${MINIO_PREFIX}" --name "*.csv" --name "*.csv.gz")
+if [ "$MONTHS" -gt 0 ]; then
+  # Build a regex covering the last N months including current, using Python for portability.
+  months_regex=$(python - <<'PY'
+import datetime, os
+m = int(os.getenv("MONTHS", "0"))
+if m <= 0:
+    print("")
+    exit()
+today = datetime.date.today()
+months = []
+for i in range(m):
+    total = today.year * 12 + today.month - 1 - i
+    y, mo = divmod(total, 12)
+    months.append(f"{y:04d}/{mo+1:02d}")
+print("(" + "|".join(months) + ")")
+PY
+)
+  if [ -z "$months_regex" ]; then
+    echo "MONTHS regex empty; importing nothing."
+    exit 0
+  fi
+  "${find_cmd[@]}" --exec 'echo {}' | grep -E "$months_regex" | \
+    xargs -I{} -n1 -P "$PARALLEL" bash -c 'import_file "$@"' _ {}
+else
+  "${find_cmd[@]}" --exec 'echo {}' | \
+    xargs -I{} -n1 -P "$PARALLEL" bash -c 'import_file "$@"' _ {}
+fi
 
 echo "Parallel import launched (PARALLEL=$PARALLEL)."
