@@ -1,30 +1,38 @@
 #!/usr/bin/env bash
 set -eo pipefail
 
-# Import daily OHLCV CSV/CSV.GZ files into Postgres.
+# Import OHLCV CSV.GZ files from MinIO into Postgres.
 # Usage:
 #   DB_URL=postgresql://user:pass@host:port/db \
+#   MINIO_ALIAS=realmclick MINIO_PREFIX=flatfiles/us_stocks_sip/minute_aggs_v1/2025 \
 #   PARALLEL=4 PAVE=0 \
-#   ./scripts/import_ohlcv.sh /path/to/data/root
+#   ./scripts/import_ohlcv.sh
 #
 # Notes:
-# - Processes files on the host and streams them into psql.
-# - No container path mapping is required; files must be readable on the host.
-# - PARALLEL controls concurrency.
+# - Requires `mc` configured with the given alias (defaults to realmclick).
+# - Streams objects directly via `mc cat` into psql; no local storage needed.
+# - PARALLEL controls concurrency of object imports.
 # - PAVE=1 truncates ohlcv before import.
 
-DATA_DIR="${1:-data}"
 DB_URL="${DB_URL:-postgresql://moobot:moobot@localhost:5432/marketdata}"
 PARALLEL="${PARALLEL:-4}"
 PAVE="${PAVE:-0}"
+MINIO_ALIAS="${MINIO_ALIAS:-realmclick}"
+MINIO_PREFIX="${MINIO_PREFIX:-flatfiles/us_stocks_sip/minute_aggs_v1/2025}"
 
 if ! command -v psql >/dev/null 2>&1; then
   echo "psql is required on the host to run this script." >&2
   exit 1
 fi
 
-if [ ! -d "$DATA_DIR" ]; then
-  echo "Data directory not found: $DATA_DIR" >&2
+if ! command -v mc >/dev/null 2>&1; then
+  echo "mc (MinIO client) is required to run this script." >&2
+  exit 1
+fi
+
+# Check access to prefix
+if ! mc ls "${MINIO_ALIAS}/${MINIO_PREFIX}" >/dev/null 2>&1; then
+  echo "Cannot list ${MINIO_ALIAS}/${MINIO_PREFIX}. Verify MINIO_ALIAS/MINIO_PREFIX and mc config." >&2
   exit 1
 fi
 
@@ -36,14 +44,8 @@ TRUNCATE TABLE ohlcv;
 SQL
 fi
 
-# Early exit if no files
-if ! find "$DATA_DIR" -type f \( -iname "*.csv" -o -iname "*.csv.gz" \) -print -quit | grep -q .; then
-  echo "No CSV or CSV.GZ files were imported from $DATA_DIR or its subfolders."
-  exit 0
-fi
-
 import_file() {
-  local f="$1"
+  local obj="$1"
   local db="$DB_URL"
 
   # decompressor (host-side)
@@ -54,23 +56,14 @@ import_file() {
     dec_cmd="gzip -dc"
   fi
 
-  if [ ! -s "$f" ]; then
-    echo "Skipping empty file: $f"
-    return 0
-  fi
-  if [ ! -r "$f" ]; then
-    echo "Skipping unreadable file: $f"
-    return 0
-  fi
+  echo "Importing ${obj}"
 
-  echo "Importing $f"
-
-  if [[ "$f" == *.gz ]]; then
+  if [[ "$obj" == *.gz ]]; then
     # use COPY FROM PROGRAM with host path
     psql "$db" -v ON_ERROR_STOP=1 <<SQL
 \set ON_ERROR_STOP 1
 CREATE TEMP TABLE ohlcv_stage_tmp (LIKE ohlcv_stage INCLUDING DEFAULTS INCLUDING CONSTRAINTS);
-\copy ohlcv_stage_tmp FROM PROGRAM '${dec_cmd} "${f}"' CSV HEADER;
+\copy ohlcv_stage_tmp FROM PROGRAM 'mc cat "${obj}" | ${dec_cmd}' CSV HEADER;
 INSERT INTO ohlcv (ticker, volume, open, close, high, low, window_start, transactions)
 SELECT
   ticker,
@@ -88,7 +81,7 @@ SQL
     psql "$db" -v ON_ERROR_STOP=1 <<SQL
 \set ON_ERROR_STOP 1
 CREATE TEMP TABLE ohlcv_stage_tmp (LIKE ohlcv_stage INCLUDING DEFAULTS INCLUDING CONSTRAINTS);
-\copy ohlcv_stage_tmp FROM '${f}' CSV HEADER;
+\copy ohlcv_stage_tmp FROM PROGRAM 'mc cat "${obj}"' CSV HEADER;
 INSERT INTO ohlcv (ticker, volume, open, close, high, low, window_start, transactions)
 SELECT
   ticker,
@@ -107,8 +100,10 @@ SQL
 
 export -f import_file
 export DB_URL
+export MINIO_ALIAS MINIO_PREFIX
 
-find "$DATA_DIR" -type f \( -iname "*.csv" -o -iname "*.csv.gz" \) -print0 | \
-  xargs -0 -n1 -P "$PARALLEL" bash -c 'import_file "$@"' _
+# Find objects in MinIO prefix and import
+mc find "${MINIO_ALIAS}/${MINIO_PREFIX}" --name "*.csv" --name "*.csv.gz" --exec 'echo {}' | \
+  xargs -I{} -n1 -P "$PARALLEL" bash -c 'import_file "$@"' _ {}
 
 echo "Parallel import launched (PARALLEL=$PARALLEL)."
