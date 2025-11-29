@@ -1,0 +1,28 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:18
+    container_name: moobot-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: moobot
+      POSTGRES_PASSWORD: moobot
+      POSTGRES_DB: marketdata
+    ports:
+      - "5432:5432"
+    volumes:
+      # Postgres 18 expects a single mount at /var/lib/postgresql with
+      # versioned subdirectories inside (see upstream image docs).
+      - db_data:/var/lib/postgresql
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      # Mount host CSV directory into container (read-only). Adjust host path as needed.
+      - /Users/johnnelson/code/ohcv/trades:/data:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U moobot -d marketdata"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  db_data:
