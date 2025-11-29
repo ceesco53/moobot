@@ -152,3 +152,7 @@ cython_debug/
 /strategy_position.json
 /.idea
 order_history.json
+.llm_cache.json
+debug_plot.html
+debug_plot.png
+llm_rules.json

@@ -6,7 +6,7 @@ Python trading bot built on the MooMoo OpenAPI with an example intraday strategy
 
 ## Features
 
-- Intraday strategy using 1m VWAP and 5m MACD + SMA signals (`strategy/Your_Strategy.py`)
+- Intraday strategy using 1m/5m MACD/VWAP/SMA signals (`strategies/your_strategy.py`)
 - Works with MooMoo/Futu OpenD for SIMULATE or REAL environments
 - Local simulator wallet (json-backed) for paper trading without a broker connection
 - Discord webhook trade notifications and a slash-command bot (`/positions`, `/pause`, `/resume`)
@@ -16,8 +16,7 @@ Python trading bot built on the MooMoo OpenAPI with an example intraday strategy
 ## Project Structure
 
 - `TradingBOT.py` — main loop, scheduling, trading context, local simulator
-- `strategy/Your_Strategy.py` — configurable MACD/VWAP/SMA strategy; edit to build your own
-- `strategy/Strategy.py` — base class used by all strategies
+- `strategies/your_strategy.py` — shared MACD/VWAP/SMA strategy used by both backtester and trade bot
 - `discord_bot.py` — optional Discord slash command bot (positions, pause/resume)
 - `discord_notification/discord_notify_webhook.py` — webhook helper for trade alerts
 - `utils/` — time utilities, logging, bot state, optional email/sound helpers
@@ -86,11 +85,51 @@ python TradingBOT.py
 
 ## Customize your strategy
 
-- Edit `strategy/Your_Strategy.py`:
-  - Update `stock_trading_list` and `trading_qty`
-  - Adjust indicator windows or replace the signal logic in `strategy_decision`
-  - Reuse `strategy_make_trade` to route orders through the Trader (broker or local sim)
+- Edit `strategies/your_strategy.py`:
+  - Adjust indicator windows or replace the signal logic in `Strategy.generate_trades`
+  - Update default sizes in `TRADING_QTY` or pass sizes at call time
 - Order history is appended to `order_history.json`; logs go to `app_running.log`.
+
+## Shared Strategy (backtest & live)
+
+`strategies/your_strategy.py` exposes a shared MACD-driven `Strategy` class so both the backtester and trade bot use the same decision logic.
+
+- Core API:
+  - `StrategyConfig(macd_diff_pct=..., macd_diff_lookback=..., macd_loose=..., rule_fns=[...], cost_per_share=..., slippage_bps=...)`
+  - `Strategy.generate_trades(ticker, g_drive, one_min, info, qty, stats) -> (trades, ending_pos, cash_delta)`
+    - `g_drive`: indicator DataFrame on the driving timeframe (5m by default, 1m if `--one-min`)
+    - `one_min`: 1m DataFrame with `vwap_1m`, `ret`, `intraday_vol` already computed
+    - `info`: optional dict from LLM gating (sentiment/do_not_trade/risk_scale)
+    - `qty`: size to trade (after any scaling)
+    - `stats`: mutable counters for debug (bull/bear crosses, filter_pass, skips)
+- Backtester usage (already wired):
+  - Env: `WALLET_BACKTEST` sets starting cash (default 2000); `DB_URL` sets data source.
+  - Example:
+    ```bash
+    ./.venv/bin/python scripts/backtest_strategy.py \
+      --tickers NVDA --start 2025-06-01 --end 2025-11-27 \
+      --one-min \
+      --macd-fast 12 --macd-slow 26 --macd-signal 9 \
+      --macd-loose --macd-diff-pct 0 --macd-diff-lookback 0 \
+      --rules-json llm_rules.json --default-qty 1 \
+      --cost-per-share 0.005 --slippage-bps 1
+    ```
+  - Flags:
+    - `--tickers`, `--start`, `--end` (end is exclusive)
+    - Timeframe/indicators: `--one-min`, `--macd-fast/--macd-slow/--macd-signal`, `--macd-loose`, `--macd-diff-pct`, `--macd-diff-lookback`
+    - Sizing: `--default-qty`, `--qty TICKER=QTY`
+    - LLM/rules: `--use-llm`, `--llm-cache`, `--rules-json`
+    - Costs: `--cost-per-share`, `--slippage-bps`
+    - Plots: defaults to interactive HTML, auto-opens; `--debug-plot-limit` caps points, `--debug-plot-path` sets filename (ticker defaults to first ticker)
+- Trade bot integration (outline):
+  - Import `Strategy, StrategyConfig`, build once at startup with your params/costs.
+  - Feed live bars into DataFrames matching the backtester:
+    - 1m frame with `ts` (tz-aware), `open/high/low/close/volume`, plus `vwap_1m`, `ret`, `intraday_vol`
+    - Driving frame (5m or 1m) with `macd`, `macd_signal`, `sma_*`
+  - Call `generate_trades(ticker, g_drive, one_min, info, qty, stats)` on bar close; translate returned `trades` into broker orders.
+  - Keep I/O (DB, broker, Discord) outside the strategy; only pass plain data and sizes in.
+
+Tip: If you add new signals, keep them contained in `Strategy` so both environments stay in sync. When you extend the context (e.g., new fields for rules), be sure to populate them in both the live feed and backtester preprocessing.
 
 ## Safety and notes
 

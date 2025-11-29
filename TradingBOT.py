@@ -74,7 +74,7 @@ TRADING_MARKET = TrdMarket.US  # set up the trading market, US market, HK for Ho
 # HKCC = "HKCC"
 # FUTURES = "FUTURES"
 USE_LOCAL_SIM_WALLET = True  # when TRADING_ENVIRONMENT is SIMULATE, bypass broker and use local wallet
-SIM_STARTING_CASH = 2000  # starting cash balance for local simulated wallet
+SIM_STARTING_CASH = int(os.getenv("WALLET_SIM", "2000"))  # starting cash balance for local simulated wallet
 DISCORD_LOG_TRADES = False  # set True to send trade messages via Discord webhook
 
 """ ⏫ project setup ⏫ """

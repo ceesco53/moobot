@@ -7,3 +7,7 @@ ta
 moomoo-api
 discord.py
 python-dotenv
+SQLAlchemy
+psycopg2-binary
+matplotlib
+plotly
