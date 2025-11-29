@@ -95,7 +95,7 @@ python TradingBOT.py
 `strategies/your_strategy.py` exposes a shared MACD-driven `Strategy` class so both the backtester and trade bot use the same decision logic.
 
 - Core API:
-  - `StrategyConfig(macd_diff_pct=..., macd_diff_lookback=..., macd_loose=..., rule_fns=[...], cost_per_share=..., slippage_bps=...)`
+  - `StrategyConfig(macd_diff_pct=..., macd_diff_lookback=..., macd_loose=..., rule_fns=[...], cost_per_share=..., slippage_bps=..., min_qty=..., cooldown_minutes=..., take_profit_pct=..., stop_loss_pct=..., max_holding_minutes=...)`
   - `Strategy.generate_trades(ticker, g_drive, one_min, info, qty, stats) -> (trades, ending_pos, cash_delta)`
     - `g_drive`: indicator DataFrame on the driving timeframe (5m by default, 1m if `--one-min`)
     - `one_min`: 1m DataFrame with `vwap_1m`, `ret`, `intraday_vol` already computed
@@ -112,15 +112,18 @@ python TradingBOT.py
       --macd-fast 12 --macd-slow 26 --macd-signal 9 \
       --macd-loose --macd-diff-pct 0 --macd-diff-lookback 0 \
       --rules-json llm_rules.json --default-qty 1 \
-      --cost-per-share 0.005 --slippage-bps 1
+      --cost-per-share 0.005 --slippage-bps 1 --min-qty 1 \
+      --cooldown-minutes 5 --take-profit-pct 0.01 --stop-loss-pct 0.005 --max-holding-minutes 60
     ```
   - Flags:
-    - `--tickers`, `--start`, `--end` (end is exclusive)
+    - Core: `--tickers`, `--start`, `--end` (end exclusive)
     - Timeframe/indicators: `--one-min`, `--macd-fast/--macd-slow/--macd-signal`, `--macd-loose`, `--macd-diff-pct`, `--macd-diff-lookback`
-    - Sizing: `--default-qty`, `--qty TICKER=QTY`
-    - LLM/rules: `--use-llm`, `--llm-cache`, `--rules-json`
+    - Sizing/risk: `--default-qty`, `--qty TICKER=QTY`, `--min-qty`, `--cooldown-minutes`
     - Costs: `--cost-per-share`, `--slippage-bps`
-    - Plots: defaults to interactive HTML, auto-opens; `--debug-plot-limit` caps points, `--debug-plot-path` sets filename (ticker defaults to first ticker)
+    - Exits: `--take-profit-pct`, `--stop-loss-pct`, `--max-holding-minutes` (triple-barrier exits); if unset, exits on MACD bear
+    - LLM/rules: `--use-llm`, `--llm-cache`, `--rules-json`
+    - Walk-forward: `--wf-test-days` (test window) and `--wf-embargo-days` (gap between folds); set to 0 to disable
+    - Plots: interactive HTML by default, auto-opens; `--debug-plot-limit` caps points, `--debug-plot-path` sets filename (ticker defaults to first ticker)
 - Trade bot integration (outline):
   - Import `Strategy, StrategyConfig`, build once at startup with your params/costs.
   - Feed live bars into DataFrames matching the backtester:
@@ -130,6 +133,24 @@ python TradingBOT.py
   - Keep I/O (DB, broker, Discord) outside the strategy; only pass plain data and sizes in.
 
 Tip: If you add new signals, keep them contained in `Strategy` so both environments stay in sync. When you extend the context (e.g., new fields for rules), be sure to populate them in both the live feed and backtester preprocessing.
+
+## Data import (MinIO -> Postgres)
+
+Use `scripts/import_ohlcv.sh` to stream OHLCV CSV/CSV.GZ from MinIO into Postgres.
+
+- Requirements: `mc` (MinIO client) configured with alias (default `realmclick`), `psql`.
+- Env/flags:
+  - `DB_URL` (default `postgresql://moobot:moobot@localhost:5432/marketdata`)
+  - `MINIO_ALIAS` (default `realmclick`)
+  - `MINIO_PREFIX` (default `flatfiles/us_stocks_sip/minute_aggs_v1/2025`)
+  - `PARALLEL` (concurrency), `PAVE=1` to truncate `ohlcv` first
+  - `MONTHS` limits import to the last N months including current (matches year/month in object path)
+- Example:
+  ```bash
+  DB_URL=postgresql://moobot:moobot@localhost:5432/marketdata \
+  MINIO_ALIAS=realmclick MINIO_PREFIX=flatfiles/us_stocks_sip/minute_aggs_v1/2025 \
+  MONTHS=2 PARALLEL=4 PAVE=0 ./scripts/import_ohlcv.sh
+  ```
 
 ## Safety and notes
 
