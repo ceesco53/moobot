@@ -25,6 +25,7 @@ Python trading bot built on the MooMoo OpenAPI with an example intraday strategy
 ## Prerequisites
 
 - Python 3.9+ recommended
+- ClickHouse (via Docker compose: `docker-compose up -d clickhouse`)
 - MooMoo/Futu OpenD installed and running (<https://www.moomoo.com/download/OpenAPI>)
 - MooMoo API docs: <https://openapi.moomoo.com/moomoo-api-doc/en/intro/intro.html>
 
@@ -134,22 +135,22 @@ python TradingBOT.py
 
 Tip: If you add new signals, keep them contained in `Strategy` so both environments stay in sync. When you extend the context (e.g., new fields for rules), be sure to populate them in both the live feed and backtester preprocessing.
 
-## Data import (MinIO -> Postgres)
+## Data import (MinIO -> ClickHouse)
 
-Use `scripts/import_ohlcv.sh` to stream OHLCV CSV/CSV.GZ from MinIO into Postgres.
+Use `scripts/clickhouse_import_ohlcv.sh` to stream OHLCV CSV/CSV.GZ from MinIO into ClickHouse over HTTP.
 
-- Requirements: `mc` (MinIO client) configured with alias (default `realmclick`), `psql`.
+- Requirements: `mc` (MinIO client) configured with alias (default `realmclick`), `curl`.
 - Env/flags:
-  - `DB_URL` (default `postgresql://moobot:moobot@localhost:5432/marketdata`)
+  - `CLICKHOUSE_HOST`/`CLICKHOUSE_PORT`/`CLICKHOUSE_USER`/`CLICKHOUSE_PASSWORD`/`CLICKHOUSE_DB` (defaults: localhost/8123/moobot/moobot/marketdata)
   - `MINIO_ALIAS` (default `realmclick`)
   - `MINIO_PREFIX` (default `flatfiles/us_stocks_sip/minute_aggs_v1/2025`)
-  - `PARALLEL` (concurrency), `PAVE=1` to truncate `ohlcv` first
+  - `PARALLEL` (concurrency), `PAVE=1` to truncate `marketdata.ohlcv` first
   - `MONTHS` limits import to the last N months including current (matches year/month in object path)
 - Example:
   ```bash
-  DB_URL=postgresql://moobot:moobot@localhost:5432/marketdata \
+  CLICKHOUSE_HOST=localhost CLICKHOUSE_USER=moobot CLICKHOUSE_PASSWORD=moobot CLICKHOUSE_DB=marketdata \
   MINIO_ALIAS=realmclick MINIO_PREFIX=flatfiles/us_stocks_sip/minute_aggs_v1/2025 \
-  MONTHS=2 PARALLEL=4 PAVE=0 ./scripts/import_ohlcv.sh
+  MONTHS=2 PARALLEL=4 PAVE=0 ./scripts/clickhouse_import_ohlcv.sh
   ```
 
 ## Safety and notes

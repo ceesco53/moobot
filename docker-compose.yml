@@ -1,41 +1,24 @@
 services:
-  postgres:
-    image: postgres:18
-    container_name: moobot-postgres
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.8
+    container_name: moobot-clickhouse
     restart: unless-stopped
     environment:
-      POSTGRES_USER: moobot
-      POSTGRES_PASSWORD: moobot
-      POSTGRES_DB: marketdata
-    command: >
-      postgres
-      -c shared_buffers=24GB
-      -c effective_cache_size=72GB
-      -c maintenance_work_mem=2GB
-      -c work_mem=64MB
-      -c wal_buffers=64MB
-      -c wal_compression=on
-      -c max_wal_size=64GB
-      -c min_wal_size=4GB
-      -c checkpoint_timeout=10min
-      -c checkpoint_completion_target=0.9
-      -c max_worker_processes=16
-      -c max_parallel_workers=16
-      -c max_parallel_workers_per_gather=8
+      CLICKHOUSE_DB: marketdata
+      CLICKHOUSE_USER: moobot
+      CLICKHOUSE_PASSWORD: moobot
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
     ports:
-      - "5432:5432"
+      - "8123:8123" # HTTP
+      - "9000:9000" # native
     volumes:
-      # Postgres 18 expects a single mount at /var/lib/postgresql with
-      # versioned subdirectories inside (see upstream image docs).
-      - ${POSTGRES_DATA_FOLDER:-db_data}:/var/lib/postgresql
-      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
-      # Mount host CSV directory into container (read-only). Adjust host path as needed.
-      - /Users/johnnelson/code/ohcv/trades:/data:ro
+      - ${CLICKHOUSE_DATA_FOLDER:-ch_data}:/var/lib/clickhouse
+      - ./db/clickhouse_init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U moobot -d marketdata"]
+      test: ["CMD-SHELL", "clickhouse-client --query \"SELECT 1\""]
       interval: 10s
       timeout: 5s
       retries: 5
 
 volumes:
-  db_data:
+  ch_data:

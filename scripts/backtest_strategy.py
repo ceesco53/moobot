@@ -1,13 +1,13 @@
 #!/usr/bin/env python
 """
 Quick-and-dirty backtester for Your_Strategy (MACD 5m + SMA 5m + VWAP 1m)
-using 1m bars from the Postgres `ohlcv` table.
+using 1m bars from the ClickHouse `ohlcv` table.
 
 Requires:
-  pip install SQLAlchemy psycopg2-binary pandas ta python-dotenv
+  pip install clickhouse-connect pandas ta python-dotenv plotly
 
 Usage examples:
-  DB_URL=postgresql://moobot:moobot@localhost:5432/marketdata \
+  DB_URL=clickhouse://moobot:moobot@localhost:8123/marketdata \
   python scripts/backtest_strategy.py --tickers AMD TSLA MU --start 2024-01-01 --end 2024-01-31
 """
 
@@ -26,12 +26,13 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import pandas as pd
-from sqlalchemy import create_engine, text
-from sqlalchemy.exc import OperationalError
 from ta.trend import SMAIndicator, MACD
 from ta.volume import VolumeWeightedAveragePrice
 from strategies.your_strategy import Strategy, StrategyConfig, Trade
 from llm_adapter import LLMConfig, get_llm_annotation
+from dotenv import load_dotenv
+from clickhouse_connect import get_client
+from urllib.parse import urlparse
 
 
 # Strategy parameters (mirror Your_Strategy)
@@ -43,32 +44,40 @@ VWAP_WINDOW_1M = 390  # up to full session
 TRADING_QTY = {"AMD": 2, "TSLA": 1, "MU": 2, "NVDA": 1}  # override with --qty if desired
 
 # Connection
-DB_URL = os.getenv("DB_URL", "postgresql://moobot:moobot@localhost:5432/marketdata")
+# Load .env if present so WALLET_BACKTEST/DB_URL/etc are picked up without manual export
+load_dotenv()
+
+DB_URL = os.getenv("DB_URL", "clickhouse://moobot:moobot@localhost:8123/marketdata")
 STARTING_CASH = int(os.getenv("WALLET_BACKTEST", "2000"))
 
 
-def load_1m(engine, tickers: List[str], start: str, end: str) -> pd.DataFrame:
-    """Fetch 1m bars from Postgres."""
-    placeholders = ", ".join([f":t{i}" for i in range(len(tickers))])
-    params = {f"t{i}": t for i, t in enumerate(tickers)}
-    params.update({"start": start, "end": end})
+def _ch_client():
+    parsed = urlparse(DB_URL)
+    host = parsed.hostname or "localhost"
+    port = parsed.port or 8123
+    username = parsed.username or "moobot"
+    password = parsed.password or "moobot"
+    database = (parsed.path or "").lstrip("/") or "marketdata"
+    secure = parsed.scheme == "https"
+    return get_client(host=host, port=port, username=username, password=password, database=database, secure=secure)
 
-    sql = text(
-        f"""
-        SELECT ticker, window_start AT TIME ZONE 'UTC' AS ts_utc,
+
+def load_1m(client, tickers: List[str], start: str, end: str) -> pd.DataFrame:
+    """Fetch 1m bars from ClickHouse."""
+    sql = """
+        SELECT ticker,
+               window_start AS ts_utc,
                open, high, low, close, volume
         FROM ohlcv
-        WHERE ticker IN ({placeholders})
-          AND window_start >= :start
-          AND window_start < :end
+        WHERE ticker IN %(tickers)s
+          AND window_start >= parseDateTime64BestEffort(%(start)s, 3)
+          AND window_start < parseDateTime64BestEffort(%(end)s, 3)
         ORDER BY ticker, window_start
-        """
-    )
-    df = pd.read_sql(sql, engine, params=params, parse_dates=["ts_utc"])
+    """
+    df = client.query_df(sql, parameters={"tickers": tickers, "start": start, "end": end})
     if df.empty:
         return df
-    # Convert to NY time for intraday session logic; drop DST headaches by using tz-aware
-    df["ts"] = df["ts_utc"].dt.tz_localize("UTC").dt.tz_convert("America/New_York")
+    df["ts"] = pd.to_datetime(df["ts_utc"], utc=True).dt.tz_convert("America/New_York")
     df = df.drop(columns=["ts_utc"])
     return df
 
@@ -157,6 +166,8 @@ def maybe_plot_debug(
     one_min_mode: bool,
     limit: int,
     interactive: bool = False,
+    start: Optional[pd.Timestamp] = None,
+    end: Optional[pd.Timestamp] = None,
 ) -> None:
     """Render a quick plot showing proximity to triggers (always interactive HTML)."""
     try:
@@ -216,6 +227,11 @@ def maybe_plot_debug(
         if pd.api.types.is_datetime64_any_dtype(df_plot[col]) and df_plot[col].dt.tz is not None:
             df_plot[col] = df_plot[col].dt.tz_convert(None)
 
+    # Apply start/end bounds if provided
+    if start is not None:
+        df_plot = df_plot[df_plot["ts"] >= start]
+    if end is not None:
+        df_plot = df_plot[df_plot["ts"] < end]
     if len(df_plot) > limit:
         df_plot = df_plot.tail(limit)
 
@@ -585,11 +601,11 @@ def main():
                 cache_path=args.llm_cache,
             )
 
-    engine = create_engine(DB_URL)
     try:
-        df_1m = load_1m(engine, [t.upper() for t in args.tickers], args.start, args.end)
-    except OperationalError as exc:
-        print(f"Could not connect to DB at {DB_URL}: {exc.orig}")
+        client = _ch_client()
+        df_1m = load_1m(client, [t.upper() for t in args.tickers], args.start, args.end)
+    except Exception as exc:
+        print(f"Could not query ClickHouse at {DB_URL}: {exc}")
         return
     if df_1m.empty:
         print("No data returned for requested tickers/date range.")
@@ -730,6 +746,8 @@ def main():
             one_min_mode=args.one_min,
             limit=args.debug_plot_limit,
             interactive=args.debug_plot_interactive,
+            start=pd.to_datetime(args.start),
+            end=pd.to_datetime(args.end),
         )
         # Auto-open interactive plot if saved as HTML
         try:

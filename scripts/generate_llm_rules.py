@@ -3,7 +3,7 @@
 Sample a few days of OHLCV, build a compact JSON feature blob, prompt an LLM for rule JSON, and write it to disk.
 
 Usage:
-  DB_URL=postgresql://moobot:moobot@localhost:5432/marketdata \
+  DB_URL=clickhouse://moobot:moobot@localhost:8123/marketdata \
   LLM_API_KEY=... \
   python scripts/generate_llm_rules.py --tickers NVDA AMD --start 2025-06-01 --end 2025-11-27 \
     --sample-days 3 --out llm_rules.json
@@ -15,10 +15,11 @@ import os
 import sys
 from pathlib import Path
 from typing import Dict, List
+from urllib.parse import urlparse
 
 import pandas as pd
 import requests
-from sqlalchemy import create_engine, text
+from clickhouse_connect import get_client
 
 # Ensure project root on path for sibling imports
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -27,28 +28,34 @@ if str(REPO_ROOT) not in sys.path:
 
 from llm_adapter import LLMConfig  # noqa: E402
 
-DB_URL = os.getenv("DB_URL", "postgresql://moobot:moobot@localhost:5432/marketdata")
+DB_URL = os.getenv("DB_URL", "clickhouse://moobot:moobot@localhost:8123/marketdata")
 
 
-def fetch_data(engine, tickers: List[str], start: str, end: str) -> pd.DataFrame:
-    placeholders = ", ".join([f":t{i}" for i in range(len(tickers))])
-    params = {f"t{i}": t for i, t in enumerate(tickers)}
-    params.update({"start": start, "end": end})
-    sql = text(
-        f"""
-        SELECT ticker, window_start AT TIME ZONE 'UTC' AS ts_utc,
+def _ch_client():
+    parsed = urlparse(DB_URL)
+    host = parsed.hostname or "localhost"
+    port = parsed.port or 8123
+    username = parsed.username or "moobot"
+    password = parsed.password or "moobot"
+    database = (parsed.path or "").lstrip("/") or "marketdata"
+    secure = parsed.scheme == "https"
+    return get_client(host=host, port=port, username=username, password=password, database=database, secure=secure)
+
+
+def fetch_data(client, tickers: List[str], start: str, end: str) -> pd.DataFrame:
+    sql = """
+        SELECT ticker, window_start AS ts_utc,
                open, high, low, close, volume
         FROM ohlcv
-        WHERE ticker IN ({placeholders})
-          AND window_start >= :start
-          AND window_start < :end
+        WHERE ticker IN %(tickers)s
+          AND window_start >= parseDateTime64BestEffort(%(start)s, 3)
+          AND window_start < parseDateTime64BestEffort(%(end)s, 3)
         ORDER BY ticker, window_start
-        """
-    )
-    df = pd.read_sql(sql, engine, params=params, parse_dates=["ts_utc"])
+    """
+    df = client.query_df(sql, parameters={"tickers": tickers, "start": start, "end": end})
     if df.empty:
         return df
-    df["ts"] = df["ts_utc"].dt.tz_localize("UTC")
+    df["ts"] = pd.to_datetime(df["ts_utc"], utc=True)
     df["date"] = df["ts"].dt.date
     return df.drop(columns=["ts_utc"])
 
@@ -137,8 +144,8 @@ def main():
         timeout=20,
     )
 
-    engine = create_engine(DB_URL)
-    df = fetch_data(engine, [t.upper() for t in args.tickers], args.start, args.end)
+    client = _ch_client()
+    df = fetch_data(client, [t.upper() for t in args.tickers], args.start, args.end)
     if df.empty:
         print("No data returned for requested tickers/date range.")
         return
